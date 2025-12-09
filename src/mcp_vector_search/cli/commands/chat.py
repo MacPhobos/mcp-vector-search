@@ -4,9 +4,12 @@ import asyncio
 import os
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import Any
 
 import typer
 from loguru import logger
+from rich.live import Live
+from rich.markdown import Markdown
 
 from ...core.database import ChromaVectorDatabase
 from ...core.embeddings import create_embedding_function
@@ -22,6 +25,96 @@ from ..output import (
     print_success,
     print_warning,
 )
+
+
+class ChatSession:
+    """Manages conversation history with automatic compaction.
+
+    Keeps system prompt intact, compacts older messages when history grows large,
+    and maintains recent exchanges for context.
+    """
+
+    # Threshold for compaction (estimated tokens, ~4 chars per token)
+    COMPACTION_THRESHOLD = 8000 * 4  # ~32000 chars
+    RECENT_EXCHANGES_TO_KEEP = 3  # Keep last N user/assistant pairs
+
+    def __init__(self, system_prompt: str) -> None:
+        """Initialize session with system prompt.
+
+        Args:
+            system_prompt: Initial system message
+        """
+        self.system_prompt = system_prompt
+        self.messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+
+    def add_message(self, role: str, content: str) -> None:
+        """Add message to history and compact if needed.
+
+        Args:
+            role: Message role (user/assistant)
+            content: Message content
+        """
+        self.messages.append({"role": role, "content": content})
+
+        # Check if compaction needed
+        total_chars = sum(len(msg["content"]) for msg in self.messages)
+        if total_chars > self.COMPACTION_THRESHOLD:
+            self._compact_history()
+
+    def _compact_history(self) -> None:
+        """Compact conversation history by summarizing older exchanges.
+
+        Strategy:
+        1. Keep system prompt intact
+        2. Summarize older exchanges into brief context
+        3. Keep recent N exchanges verbatim
+        """
+        logger.debug("Compacting conversation history")
+
+        # Separate system prompt and conversation
+        system_msg = self.messages[0]
+        conversation = self.messages[1:]
+
+        # Keep recent exchanges (last N user/assistant pairs)
+        recent_start = max(0, len(conversation) - (self.RECENT_EXCHANGES_TO_KEEP * 2))
+        older_messages = conversation[:recent_start]
+        recent_messages = conversation[recent_start:]
+
+        # Summarize older messages
+        if older_messages:
+            summary_parts = []
+            for msg in older_messages:
+                role = msg["role"].capitalize()
+                content_preview = msg["content"][:100].replace("\n", " ")
+                summary_parts.append(f"{role}: {content_preview}...")
+
+            summary = "\n".join(summary_parts)
+            summary_msg = {
+                "role": "system",
+                "content": f"[Previous conversation summary]\n{summary}\n[End summary]",
+            }
+
+            # Rebuild messages: system + summary + recent
+            self.messages = [system_msg, summary_msg] + recent_messages
+
+            logger.debug(
+                f"Compacted {len(older_messages)} old messages, kept {len(recent_messages)} recent"
+            )
+
+    def get_messages(self) -> list[dict[str, str]]:
+        """Get current message history.
+
+        Returns:
+            List of message dictionaries
+        """
+        return self.messages.copy()
+
+    def clear(self) -> None:
+        """Clear conversation history, keeping only system prompt."""
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+
 
 # Create chat subcommand app with "did you mean" functionality
 chat_app = create_enhanced_typer(
@@ -177,9 +270,9 @@ def chat_main(
             )
             raise typer.Exit(1)
 
-        # Run the chat search
+        # Run the chat with intent detection and routing
         asyncio.run(
-            run_chat_search(
+            run_chat_with_intent(
                 project_root=project_root,
                 query=query,
                 limit=limit,
@@ -193,9 +286,569 @@ def chat_main(
         )
 
     except Exception as e:
-        logger.error(f"Chat search failed: {e}")
-        print_error(f"Chat search failed: {e}")
+        logger.error(f"Chat failed: {e}")
+        print_error(f"Chat failed: {e}")
         raise typer.Exit(1)
+
+
+async def run_chat_with_intent(
+    project_root: Path,
+    query: str,
+    limit: int = 5,
+    model: str | None = None,
+    provider: str | None = None,
+    timeout: float = 30.0,
+    json_output: bool = False,
+    files: str | None = None,
+    think: bool = False,
+) -> None:
+    """Route to appropriate chat mode based on detected intent.
+
+    Args:
+        project_root: Project root directory
+        query: User's natural language query
+        limit: Maximum results to return
+        model: Model to use (optional)
+        provider: LLM provider
+        timeout: API timeout
+        json_output: Whether to output JSON
+        files: File pattern filter
+        think: Use advanced model
+    """
+    # Initialize LLM client for intent detection
+    from ...core.config_utils import (
+        get_openai_api_key,
+        get_openrouter_api_key,
+        get_preferred_llm_provider,
+    )
+
+    config_dir = project_root / ".mcp-vector-search"
+    openai_key = get_openai_api_key(config_dir)
+    openrouter_key = get_openrouter_api_key(config_dir)
+
+    # Determine provider (same logic as before)
+    if not provider:
+        preferred_provider = get_preferred_llm_provider(config_dir)
+        if preferred_provider == "openai" and openai_key:
+            provider = "openai"
+        elif preferred_provider == "openrouter" and openrouter_key:
+            provider = "openrouter"
+        elif openai_key:
+            provider = "openai"
+        elif openrouter_key:
+            provider = "openrouter"
+        else:
+            print_error("No LLM API key found.")
+            raise typer.Exit(1)
+
+    # Create temporary client for intent detection (use fast model)
+    try:
+        intent_client = LLMClient(
+            openai_api_key=openai_key,
+            openrouter_api_key=openrouter_key,
+            provider=provider,
+            timeout=timeout,
+            think=False,  # Use fast model for intent detection
+        )
+
+        # Detect intent
+        intent = await intent_client.detect_intent(query)
+
+        # Show intent to user
+        if intent == "find":
+            console.print("\n[cyan]🔍 Intent: Find[/cyan] - Searching codebase\n")
+            await run_chat_search(
+                project_root=project_root,
+                query=query,
+                limit=limit,
+                model=model,
+                provider=provider,
+                timeout=timeout,
+                json_output=json_output,
+                files=files,
+                think=think,
+            )
+        else:
+            # Answer mode - force think mode and enter interactive session
+            console.print(
+                "\n[cyan]💬 Intent: Answer[/cyan] - Entering interactive mode\n"
+            )
+            await run_chat_answer(
+                project_root=project_root,
+                initial_query=query,
+                limit=limit,
+                model=model,
+                provider=provider,
+                timeout=timeout,
+                files=files,
+            )
+
+    except Exception as e:
+        logger.error(f"Intent detection failed: {e}")
+        # Default to find mode on error
+        console.print("\n[yellow]⚠ Using default search mode[/yellow]\n")
+        await run_chat_search(
+            project_root=project_root,
+            query=query,
+            limit=limit,
+            model=model,
+            provider=provider,
+            timeout=timeout,
+            json_output=json_output,
+            files=files,
+            think=think,
+        )
+
+
+async def run_chat_answer(
+    project_root: Path,
+    initial_query: str,
+    limit: int = 5,
+    model: str | None = None,
+    provider: str | None = None,
+    timeout: float = 30.0,
+    files: str | None = None,
+) -> None:
+    """Run interactive answer mode with streaming responses.
+
+    Args:
+        project_root: Project root directory
+        initial_query: Initial user question
+        limit: Max search results for context
+        model: Model to use (optional, defaults to advanced model)
+        provider: LLM provider
+        timeout: API timeout
+        files: File pattern filter
+    """
+    from ...core.config_utils import get_openai_api_key, get_openrouter_api_key
+
+    config_dir = project_root / ".mcp-vector-search"
+    openai_key = get_openai_api_key(config_dir)
+    openrouter_key = get_openrouter_api_key(config_dir)
+
+    # Load project configuration
+    project_manager = ProjectManager(project_root)
+    if not project_manager.is_initialized():
+        raise ProjectNotFoundError(
+            f"Project not initialized at {project_root}. Run 'mcp-vector-search init' first."
+        )
+
+    config = project_manager.load_config()
+
+    # Initialize LLM client with advanced model (force think mode)
+    try:
+        llm_client = LLMClient(
+            openai_api_key=openai_key,
+            openrouter_api_key=openrouter_key,
+            model=model,
+            provider=provider,
+            timeout=timeout,
+            think=True,  # Always use advanced model for answer mode
+        )
+        provider_display = llm_client.provider.capitalize()
+        model_info = f"{llm_client.model} [bold magenta](thinking mode)[/bold magenta]"
+        print_success(f"Connected to {provider_display}: {model_info}")
+    except ValueError as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    # Initialize search engine
+    embedding_function, _ = create_embedding_function(config.embedding_model)
+    database = ChromaVectorDatabase(
+        persist_directory=config.index_path,
+        embedding_function=embedding_function,
+    )
+    search_engine = SemanticSearchEngine(
+        database=database,
+        project_root=project_root,
+        similarity_threshold=config.similarity_threshold,
+    )
+
+    # Initialize session (cleared on startup)
+    system_prompt = """You are a helpful code assistant analyzing a codebase. Answer questions based on provided code context.
+
+Guidelines:
+- Be concise but thorough
+- Reference specific functions, classes, or files
+- Use code examples when helpful
+- If context is insufficient, say so
+- Use markdown formatting"""
+
+    session = ChatSession(system_prompt)
+
+    # Process initial query
+    await _process_answer_query(
+        query=initial_query,
+        llm_client=llm_client,
+        search_engine=search_engine,
+        database=database,
+        session=session,
+        project_root=project_root,
+        limit=limit,
+        files=files,
+        config=config,
+    )
+
+    # Interactive loop
+    console.print("\n[dim]Type your questions or '/exit' to quit[/dim]\n")
+
+    while True:
+        try:
+            # Get user input
+            user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
+
+            if not user_input:
+                continue
+
+            # Check for exit command
+            if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+                console.print("\n[cyan]👋 Session ended.[/cyan]")
+                break
+
+            # Process query
+            await _process_answer_query(
+                query=user_input,
+                llm_client=llm_client,
+                search_engine=search_engine,
+                database=database,
+                session=session,
+                project_root=project_root,
+                limit=limit,
+                files=files,
+                config=config,
+            )
+
+        except KeyboardInterrupt:
+            console.print("\n\n[cyan]👋 Session ended.[/cyan]")
+            break
+        except EOFError:
+            console.print("\n\n[cyan]👋 Session ended.[/cyan]")
+            break
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            print_error(f"Error: {e}")
+
+
+async def _process_answer_query(
+    query: str,
+    llm_client: LLMClient,
+    search_engine: SemanticSearchEngine,
+    database: ChromaVectorDatabase,
+    session: ChatSession,
+    project_root: Path,
+    limit: int,
+    files: str | None,
+    config: Any,
+) -> None:
+    """Process a single answer query with agentic tool use.
+
+    Args:
+        query: User query
+        llm_client: LLM client instance
+        search_engine: Search engine instance
+        database: Vector database
+        session: Chat session
+        project_root: Project root path
+        limit: Max results
+        files: File pattern filter
+        config: Project config
+    """
+    # Define search tools for the LLM
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_code",
+                "description": "Search the codebase for relevant code snippets using semantic search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to find relevant code (e.g., 'authentication logic', 'database connection', 'error handling')",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 5, max: 10)",
+                            "default": 5,
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the full content of a specific file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Relative path to the file from project root",
+                        }
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files in the codebase matching a pattern",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern to match files (e.g., '*.py', 'src/**/*.ts', 'tests/')",
+                        }
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        },
+    ]
+
+    # System prompt for tool use
+    system_prompt = """You are a helpful code assistant with access to search tools. Use these tools to find and analyze code in the codebase.
+
+Available tools:
+- search_code: Search for relevant code using semantic search
+- read_file: Read the full content of a specific file
+- list_files: List files matching a pattern
+
+Guidelines:
+1. Use search_code to find relevant code snippets
+2. Use read_file when you need to see the full file context
+3. Use list_files to understand the project structure
+4. Make multiple searches if needed to gather enough context
+5. After gathering sufficient information, provide your analysis
+
+Always base your answers on actual code from the tools. If you can't find relevant code, say so."""
+
+    # Tool execution functions
+    async def execute_search_code(query_str: str, limit_val: int = 5) -> str:
+        """Execute search_code tool."""
+        try:
+            limit_val = min(limit_val, 10)  # Cap at 10
+            async with database:
+                results = await search_engine.search(
+                    query=query_str,
+                    limit=limit_val,
+                    similarity_threshold=config.similarity_threshold,
+                    include_context=True,
+                )
+
+                # Post-filter by file pattern if specified
+                if files and results:
+                    filtered_results = []
+                    for result in results:
+                        try:
+                            rel_path = str(result.file_path.relative_to(project_root))
+                        except ValueError:
+                            rel_path = str(result.file_path)
+
+                        if fnmatch(rel_path, files) or fnmatch(
+                            os.path.basename(rel_path), files
+                        ):
+                            filtered_results.append(result)
+                    results = filtered_results
+
+            if not results:
+                return "No results found for this query."
+
+            # Format results
+            result_parts = []
+            for i, result in enumerate(results, 1):
+                try:
+                    rel_path = str(result.file_path.relative_to(project_root))
+                except ValueError:
+                    rel_path = str(result.file_path)
+
+                result_parts.append(
+                    f"[Result {i}: {rel_path}]\n"
+                    f"Location: {result.location}\n"
+                    f"Lines {result.start_line}-{result.end_line}\n"
+                    f"Similarity: {result.similarity_score:.3f}\n"
+                    f"```\n{result.content}\n```\n"
+                )
+            return "\n".join(result_parts)
+
+        except Exception as e:
+            logger.error(f"search_code tool failed: {e}")
+            return f"Error searching code: {e}"
+
+    async def execute_read_file(file_path: str) -> str:
+        """Execute read_file tool."""
+        try:
+            # Normalize path
+            if file_path.startswith("/"):
+                full_path = Path(file_path)
+            else:
+                full_path = project_root / file_path
+
+            # Security check: file must be within project
+            try:
+                full_path.relative_to(project_root)
+            except ValueError:
+                return f"Error: File must be within project root: {project_root}"
+
+            if not full_path.exists():
+                return f"Error: File not found: {file_path}"
+
+            if not full_path.is_file():
+                return f"Error: Not a file: {file_path}"
+
+            # Read file with size limit
+            max_size = 100_000  # 100KB
+            file_size = full_path.stat().st_size
+            if file_size > max_size:
+                return f"Error: File too large ({file_size} bytes). Use search_code instead."
+
+            content = full_path.read_text(errors="replace")
+            return f"File: {file_path}\n```\n{content}\n```"
+
+        except Exception as e:
+            logger.error(f"read_file tool failed: {e}")
+            return f"Error reading file: {e}"
+
+    async def execute_list_files(pattern: str) -> str:
+        """Execute list_files tool."""
+        try:
+            from glob import glob
+
+            # Use glob to find matching files
+            matches = glob(str(project_root / pattern), recursive=True)
+
+            if not matches:
+                return f"No files found matching pattern: {pattern}"
+
+            # Get relative paths and limit results
+            rel_paths = []
+            for match in matches[:50]:  # Limit to 50 files
+                try:
+                    rel_path = Path(match).relative_to(project_root)
+                    rel_paths.append(str(rel_path))
+                except ValueError:
+                    continue
+
+            if not rel_paths:
+                return f"No files found matching pattern: {pattern}"
+
+            return f"Files matching '{pattern}':\n" + "\n".join(
+                f"- {p}" for p in sorted(rel_paths)
+            )
+
+        except Exception as e:
+            logger.error(f"list_files tool failed: {e}")
+            return f"Error listing files: {e}"
+
+    # Get conversation history
+    conversation_history = session.get_messages()[1:]  # Skip system prompt
+
+    # Build messages: system + history + current query
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": query})
+
+    # Agentic loop
+    max_iterations = 10
+    for _iteration in range(max_iterations):
+        try:
+            response = await llm_client.chat_with_tools(messages, tools)
+
+            # Extract message from response
+            choice = response.get("choices", [{}])[0]
+            message = choice.get("message", {})
+
+            # Check for tool calls
+            tool_calls = message.get("tool_calls", [])
+
+            if tool_calls:
+                # Add assistant message with tool calls
+                messages.append(message)
+
+                # Execute each tool call
+                for tool_call in tool_calls:
+                    tool_id = tool_call.get("id")
+                    function = tool_call.get("function", {})
+                    function_name = function.get("name")
+                    arguments_str = function.get("arguments", "{}")
+
+                    # Parse arguments
+                    try:
+                        import json
+
+                        arguments = json.loads(arguments_str)
+                    except json.JSONDecodeError:
+                        arguments = {}
+
+                    # Display tool usage
+                    console.print(
+                        f"\n[dim]🔧 Using tool: {function_name}({', '.join(f'{k}={repr(v)}' for k, v in arguments.items())})[/dim]"
+                    )
+
+                    # Execute tool
+                    if function_name == "search_code":
+                        result = await execute_search_code(
+                            arguments.get("query", ""),
+                            arguments.get("limit", 5),
+                        )
+                        console.print(
+                            f"[dim]   Found {len(result.split('[Result')) - 1} results[/dim]"
+                        )
+                    elif function_name == "read_file":
+                        result = await execute_read_file(arguments.get("file_path", ""))
+                        console.print("[dim]   Read file[/dim]")
+                    elif function_name == "list_files":
+                        result = await execute_list_files(arguments.get("pattern", ""))
+                        console.print("[dim]   Listed files[/dim]")
+                    else:
+                        result = f"Error: Unknown tool: {function_name}"
+
+                    # Add tool result to messages
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": result,
+                        }
+                    )
+
+            else:
+                # No tool calls - final response
+                final_content = message.get("content", "")
+
+                if not final_content:
+                    print_error("LLM returned empty response")
+                    return
+
+                # Stream the final response
+                console.print("\n[bold cyan]🤖 Assistant:[/bold cyan]\n")
+
+                # Use Rich Live for rendering
+                with Live("", console=console, auto_refresh=True) as live:
+                    live.update(Markdown(final_content))
+
+                # Add to session history
+                session.add_message("user", query)
+                session.add_message("assistant", final_content)
+
+                return
+
+        except Exception as e:
+            logger.error(f"Tool execution loop failed: {e}")
+            print_error(f"Error: {e}")
+            return
+
+    # Max iterations reached
+    print_warning(
+        "\n⚠ Maximum iterations reached. The assistant may not have gathered enough information."
+    )
 
 
 async def run_chat_search(
