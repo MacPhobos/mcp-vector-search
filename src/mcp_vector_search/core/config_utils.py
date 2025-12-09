@@ -27,7 +27,14 @@ from loguru import logger
 CONFIG_FILENAME = "config.json"
 
 # Sensitive keys that should never be logged in full
-SENSITIVE_KEYS = {"openrouter_api_key", "openai_api_key", "api_key", "token", "secret"}
+SENSITIVE_KEYS = {
+    "openrouter_api_key",
+    "openai_api_key",
+    "ollama_api_key",
+    "api_key",
+    "token",
+    "secret",
+}
 
 
 class ConfigManager:
@@ -340,6 +347,95 @@ def delete_openai_api_key(config_dir: Path) -> bool:
     """
     manager = ConfigManager(config_dir)
     return manager.delete_value("openai_api_key")
+
+
+def get_ollama_api_key(config_dir: Path | None = None) -> str | None:
+    """Get Ollama API key from config file or environment.
+
+    Priority:
+    1. OLLAMA_API_KEY environment variable
+    2. ollama_api_key from config file
+    3. Default: 'ollama' (for local server)
+
+    Args:
+        config_dir: Optional config directory (defaults to current project)
+
+    Returns:
+        API key if found, otherwise 'ollama' as default for local server
+    """
+    # Check environment variable first
+    env_key = os.environ.get("OLLAMA_API_KEY")
+    if env_key:
+        return env_key
+
+    # Check config file
+    try:
+        config_file = get_config_file_path(config_dir)
+        if config_file.exists():
+            with open(config_file) as f:
+                config_data = json.load(f)
+                config_key = config_data.get("ollama_api_key")
+                if config_key:
+                    return config_key
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug(f"Failed to read Ollama API key from config: {e}")
+
+    # Default for local Ollama server
+    return "ollama"
+
+
+def save_ollama_api_key(api_key: str, config_dir: Path) -> None:
+    """Save Ollama API key to config file.
+
+    Args:
+        api_key: Ollama API key to save
+        config_dir: Config directory path
+    """
+    config_file = get_config_file_path(config_dir)
+
+    # Ensure config directory exists
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load existing config or create new
+    config_data = {}
+    if config_file.exists():
+        with open(config_file) as f:
+            config_data = json.load(f)
+
+    # Update ollama_api_key
+    config_data["ollama_api_key"] = api_key
+
+    # Save back to file
+    with open(config_file, "w") as f:
+        json.dump(config_data, f, indent=2)
+
+
+def delete_ollama_api_key(config_dir: Path) -> bool:
+    """Delete Ollama API key from config file.
+
+    Args:
+        config_dir: Config directory path
+
+    Returns:
+        True if key was deleted, False if not found
+    """
+    config_file = get_config_file_path(config_dir)
+
+    if not config_file.exists():
+        return False
+
+    with open(config_file) as f:
+        config_data = json.load(f)
+
+    if "ollama_api_key" in config_data:
+        del config_data["ollama_api_key"]
+
+        with open(config_file, "w") as f:
+            json.dump(config_data, f, indent=2)
+
+        return True
+
+    return False
 
 
 def get_preferred_llm_provider(config_dir: Path | None = None) -> str | None:

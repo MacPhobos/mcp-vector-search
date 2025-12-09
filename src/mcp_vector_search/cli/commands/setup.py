@@ -310,7 +310,7 @@ def _obfuscate_api_key(api_key: str) -> str:
 
 
 def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
-    """Check and optionally set up LLM API keys (OpenAI or OpenRouter) for chat command.
+    """Check and optionally set up LLM API keys (OpenAI, OpenRouter, or Ollama) for chat command.
 
     This function checks for API keys in environment and config file.
     In interactive mode, prompts user to configure either provider.
@@ -324,11 +324,14 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
     """
     from ...core.config_utils import (
         delete_openai_api_key,
+        delete_ollama_api_key,
         delete_openrouter_api_key,
         get_config_file_path,
+        get_ollama_api_key,
         get_openai_api_key,
         get_openrouter_api_key,
         get_preferred_llm_provider,
+        save_ollama_api_key,
         save_openai_api_key,
         save_openrouter_api_key,
         save_preferred_llm_provider,
@@ -339,12 +342,16 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
     # Check if API keys are already available
     openai_key = get_openai_api_key(config_dir)
     openrouter_key = get_openrouter_api_key(config_dir)
+    ollama_key = get_ollama_api_key(config_dir)
     preferred_provider = get_preferred_llm_provider(config_dir)
 
     openai_from_env = bool(os.environ.get("OPENAI_API_KEY"))
     openrouter_from_env = bool(os.environ.get("OPENROUTER_API_KEY"))
+    ollama_from_env = bool(os.environ.get("OLLAMA_API_KEY"))
 
-    has_any_key = bool(openai_key or openrouter_key)
+    has_any_key = bool(
+        openai_key or openrouter_key or (ollama_key and ollama_key != "ollama")
+    )
 
     # Non-interactive mode: just report status
     if not interactive:
@@ -388,6 +395,11 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
             print_info("   1. Get a key: [cyan]https://openrouter.ai/keys[/cyan]")
             print_info("   2. [yellow]export OPENROUTER_API_KEY='your-key'[/yellow]")
             print_info("")
+            print_info("   [cyan]Option C - Ollama (local):[/cyan]")
+            print_info("   1. Install Ollama: [cyan]https://ollama.ai[/cyan]")
+            print_info("   2. [yellow]ollama serve[/yellow]")
+            print_info("   3. [yellow]export OLLAMA_API_KEY='ollama'[/yellow] (optional)")
+            print_info("")
             print_info("   Or run: [yellow]mcp-vector-search setup[/yellow]")
             print_info("")
             print_info(
@@ -400,11 +412,11 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
     print_info("   [bold cyan]LLM API Key Setup[/bold cyan]")
     print_info("")
     print_info("   The 'chat' command uses AI to answer questions about your code.")
-    print_info("   You can use OpenAI or OpenRouter (or both).")
+    print_info("   You can use OpenAI, OpenRouter, or Ollama (or multiple).")
     print_info("")
 
     # Show current status
-    if openai_key or openrouter_key:
+    if openai_key or openrouter_key or (ollama_key and ollama_key != "ollama"):
         print_info("   [bold]Current Configuration:[/bold]")
         if openai_key:
             obfuscated = _obfuscate_api_key(openai_key)
@@ -420,6 +432,13 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
         else:
             print_info("   • OpenRouter: [dim]not configured[/dim]")
 
+        if ollama_key and ollama_key != "ollama":
+            obfuscated = _obfuscate_api_key(ollama_key)
+            source = "environment variable" if ollama_from_env else "config file"
+            print_info(f"   • Ollama: {obfuscated} [dim]({source})[/dim]")
+        else:
+            print_info("   • Ollama: [dim]using default (local server)[/dim]")
+
         if preferred_provider:
             print_info(f"   • Preferred: [cyan]{preferred_provider}[/cyan]")
         print_info("")
@@ -427,14 +446,15 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
     print_info("   [bold cyan]Options:[/bold cyan]")
     print_info("   1. Configure OpenAI (recommended, fast & cheap)")
     print_info("   2. Configure OpenRouter")
-    print_info("   3. Set preferred provider")
-    print_info("   4. Skip / Keep current")
+    print_info("   3. Configure Ollama (local, no API key needed)")
+    print_info("   4. Set preferred provider")
+    print_info("   5. Skip / Keep current")
     print_info("")
 
     try:
         from ..output import console
 
-        choice = console.input("   [yellow]Select option (1-4): [/yellow]").strip()
+        choice = console.input("   [yellow]Select option (1-5): [/yellow]").strip()
 
         if choice == "1":
             # Configure OpenAI
@@ -461,6 +481,18 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
             )
 
         elif choice == "3":
+            # Configure Ollama
+            return _setup_single_provider(
+                provider="ollama",
+                existing_key=ollama_key if ollama_key != "ollama" else None,
+                is_from_env=ollama_from_env,
+                config_dir=config_dir,
+                save_func=save_ollama_api_key,
+                delete_func=delete_ollama_api_key,
+                get_key_url="https://ollama.ai",
+            )
+
+        elif choice == "4":
             # Set preferred provider
             if not has_any_key:
                 print_warning("   ⚠️  Configure at least one API key first")
@@ -476,6 +508,10 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
                 providers.append("openrouter")
                 idx = len(providers)
                 print_info(f"   {idx}. OpenRouter")
+            if ollama_key and ollama_key != "ollama":
+                providers.append("ollama")
+                idx = len(providers)
+                print_info(f"   {idx}. Ollama")
 
             pref_choice = console.input(
                 f"\n   [yellow]Select (1-{len(providers)}): [/yellow]"
@@ -497,7 +533,7 @@ def setup_llm_api_keys(project_root: Path, interactive: bool = True) -> bool:
                 print_warning("   ⚠️  Invalid input")
                 return has_any_key
 
-        elif choice == "4" or not choice:
+        elif choice == "5" or not choice:
             # Skip / Keep current
             if has_any_key:
                 print_info("   ⏭️  Keeping existing configuration")
@@ -531,7 +567,7 @@ def _setup_single_provider(
     """Helper function to set up a single LLM provider.
 
     Args:
-        provider: Provider name ('openai' or 'openrouter')
+        provider: Provider name ('openai', 'openrouter', or 'ollama')
         existing_key: Existing API key if any
         is_from_env: Whether existing key is from environment
         config_dir: Config directory path

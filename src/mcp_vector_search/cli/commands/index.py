@@ -392,6 +392,7 @@ async def _run_batch_indexing(
     if indexed_count > 0:
         # Check if LLM is configured for chat command
         from mcp_vector_search.core.config_utils import (
+            get_ollama_api_key,
             get_openai_api_key,
             get_openrouter_api_key,
         )
@@ -399,10 +400,16 @@ async def _run_batch_indexing(
         config_dir = indexer.project_root / ".mcp-vector-search"
         has_openai = get_openai_api_key(config_dir) is not None
         has_openrouter = get_openrouter_api_key(config_dir) is not None
-        llm_configured = has_openai or has_openrouter
+        has_ollama = get_ollama_api_key(config_dir) is not None
+        llm_configured = has_openai or has_openrouter or has_ollama
 
         if llm_configured:
-            provider = "OpenAI" if has_openai else "OpenRouter"
+            if has_openai:
+                provider = "OpenAI"
+            elif has_openrouter:
+                provider = "OpenRouter"
+            else:
+                provider = "Ollama"
             chat_hint = f"[cyan]mcp-vector-search chat 'question'[/cyan] - Ask AI about your code [green](✓ {provider})[/green]"
         else:
             chat_hint = "[cyan]mcp-vector-search chat 'question'[/cyan] - Ask AI about your code [dim](requires API key)[/dim]"
