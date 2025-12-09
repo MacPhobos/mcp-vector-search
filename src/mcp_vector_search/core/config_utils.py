@@ -349,7 +349,7 @@ def get_preferred_llm_provider(config_dir: Path | None = None) -> str | None:
         config_dir: Config directory path (uses .mcp-vector-search in cwd if None)
 
     Returns:
-        Provider name ('openai' or 'openrouter') if set, None otherwise
+        Provider name ('openai', 'openrouter', or 'ollama') if set, None otherwise
     """
     if config_dir is None:
         config_dir = Path.cwd() / ".mcp-vector-search"
@@ -365,15 +365,15 @@ def save_preferred_llm_provider(provider: str, config_dir: Path) -> None:
     """Save preferred LLM provider to config file.
 
     Args:
-        provider: Provider name ('openai' or 'openrouter')
+        provider: Provider name ('openai', 'openrouter', or 'ollama')
         config_dir: Config directory path
 
     Raises:
         ValueError: If provider is not valid
     """
-    if provider not in ("openai", "openrouter"):
+    if provider not in ("openai", "openrouter", "ollama"):
         raise ValueError(
-            f"Invalid provider: {provider}. Must be 'openai' or 'openrouter'"
+            f"Invalid provider: {provider}. Must be 'openai', 'openrouter', or 'ollama'"
         )
 
     manager = ConfigManager(config_dir)

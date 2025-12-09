@@ -67,7 +67,7 @@ def chat_main(
     provider: str | None = typer.Option(
         None,
         "--provider",
-        help="LLM provider to use: 'openai' or 'openrouter' (auto-detect if not specified)",
+        help="LLM provider to use: 'openai', 'openrouter', or 'ollama' (auto-detect if not specified)",
         rich_help_panel="🤖 LLM Options",
     ),
     timeout: float | None = typer.Option(
@@ -101,7 +101,7 @@ def chat_main(
 ) -> None:
     """🤖 Ask questions about your code in natural language.
 
-    Uses LLM (OpenAI or OpenRouter) to intelligently search your codebase and answer
+    Uses LLM (OpenAI, OpenRouter, or Ollama) to intelligently search your codebase and answer
     questions like "where is X defined?", "how does Y work?", etc.
 
     [bold cyan]Setup:[/bold cyan]
@@ -114,7 +114,11 @@ def chat_main(
         $ export OPENROUTER_API_KEY="your-key-here"
         Get a key at: [cyan]https://openrouter.ai/keys[/cyan]
 
-    [dim]Provider is auto-detected. OpenAI is preferred if both keys are set.[/dim]
+    [green]Option C - Ollama (local):[/green]
+        $ ollama serve
+        Models run locally, no API key needed.
+
+    [dim]Provider is auto-detected. OpenAI is preferred if multiple keys are set.[/dim]
 
     [bold cyan]Examples:[/bold cyan]
 
@@ -130,6 +134,7 @@ def chat_main(
     [green]Force specific provider:[/green]
         $ mcp-vector-search chat "question" --provider openai
         $ mcp-vector-search chat "question" --provider openrouter
+        $ mcp-vector-search chat "question" --provider ollama
 
     [green]Use custom model:[/green]
         $ mcp-vector-search chat "question" --model gpt-4o
@@ -166,9 +171,9 @@ def chat_main(
         project_root = project_root or ctx.obj.get("project_root") or Path.cwd()
 
         # Validate provider if specified
-        if provider and provider not in ("openai", "openrouter"):
+        if provider and provider not in ("openai", "openrouter", "ollama"):
             print_error(
-                f"Invalid provider: {provider}. Must be 'openai' or 'openrouter'"
+                f"Invalid provider: {provider}. Must be 'openai', 'openrouter', or 'ollama'"
             )
             raise typer.Exit(1)
 
@@ -218,7 +223,7 @@ async def run_chat_search(
         query: Natural language query from user
         limit: Maximum number of results to return
         model: Model to use (optional, defaults based on provider)
-        provider: LLM provider ('openai' or 'openrouter', auto-detect if None)
+        provider: LLM provider ('openai', 'openrouter', or 'ollama', auto-detect if None)
         timeout: API timeout in seconds
         json_output: Whether to output JSON format
         files: Optional glob pattern to filter files (e.g., '*.py', 'src/*.js')
@@ -235,6 +240,7 @@ async def run_chat_search(
     config_dir = project_root / ".mcp-vector-search"
     openai_key = get_openai_api_key(config_dir)
     openrouter_key = get_openrouter_api_key(config_dir)
+    ollama_key = os.environ.get("OLLAMA_API_KEY", "ollama")  # Dummy key for Ollama
 
     # Determine which provider to use
     if provider:
@@ -259,6 +265,9 @@ async def run_chat_search(
             print_info("")
             print_info("Or run: [cyan]mcp-vector-search setup[/cyan]")
             raise typer.Exit(1)
+        elif provider == "ollama":
+            # Ollama doesn't require validation, it's always available if running locally
+            pass
     else:
         # Auto-detect provider
         preferred_provider = get_preferred_llm_provider(config_dir)
@@ -267,6 +276,8 @@ async def run_chat_search(
             provider = "openai"
         elif preferred_provider == "openrouter" and openrouter_key:
             provider = "openrouter"
+        elif preferred_provider == "ollama":
+            provider = "ollama"
         elif openai_key:
             provider = "openai"
         elif openrouter_key:
@@ -284,6 +295,11 @@ async def run_chat_search(
             print_info("[cyan]Option B - OpenRouter:[/cyan]")
             print_info("1. Get a key from [cyan]https://openrouter.ai/keys[/cyan]")
             print_info("2. [yellow]export OPENROUTER_API_KEY='your-key'[/yellow]")
+            print_info("")
+            print_info("[cyan]Option C - Ollama (local):[/cyan]")
+            print_info("1. Install Ollama from [cyan]https://ollama.ai[/cyan]")
+            print_info("2. [yellow]ollama serve[/yellow]")
+            print_info("3. [yellow]mcp-vector-search chat 'query' --provider ollama[/yellow]")
             print_info("")
             print_info("Or run: [cyan]mcp-vector-search setup[/cyan]")
             config_path = get_config_file_path(config_dir)
@@ -305,6 +321,7 @@ async def run_chat_search(
         llm_client = LLMClient(
             openai_api_key=openai_key,
             openrouter_api_key=openrouter_key,
+            ollama_api_key=ollama_key,
             model=model,
             provider=provider,
             timeout=timeout,

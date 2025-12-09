@@ -10,7 +10,7 @@ from loguru import logger
 from .exceptions import SearchError
 
 # Type alias for provider
-LLMProvider = Literal["openai", "openrouter"]
+LLMProvider = Literal["openai", "openrouter", "ollama"]
 
 
 class LLMClient:
@@ -31,18 +31,21 @@ class LLMClient:
     DEFAULT_MODELS = {
         "openai": "gpt-4o-mini",  # Fast, cheap, comparable to claude-3-haiku
         "openrouter": "anthropic/claude-3-haiku",
+        "ollama": "gpt-oss:20b",
     }
 
     # Advanced "thinking" models for complex queries (--think flag)
     THINKING_MODELS = {
         "openai": "gpt-4o",  # More capable, better reasoning
         "openrouter": "anthropic/claude-sonnet-4",  # Claude Sonnet 4 for deep analysis
+        "ollama": "gpt-oss:20b",
     }
 
     # API endpoints
     API_ENDPOINTS = {
         "openai": "https://api.openai.com/v1/chat/completions",
         "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+        "ollama": "http://localhost:11434/v1/chat/completions",
     }
 
     TIMEOUT_SECONDS = 30.0
@@ -55,6 +58,7 @@ class LLMClient:
         provider: LLMProvider | None = None,
         openai_api_key: str | None = None,
         openrouter_api_key: str | None = None,
+        ollama_api_key: str | None = None,
         think: bool = False,
     ) -> None:
         """Initialize LLM client.
@@ -63,9 +67,10 @@ class LLMClient:
             api_key: API key (deprecated, use provider-specific keys)
             model: Model to use (defaults based on provider)
             timeout: Request timeout in seconds
-            provider: Explicit provider ('openai' or 'openrouter')
+            provider: Explicit provider ('openai', 'openrouter', or 'ollama')
             openai_api_key: OpenAI API key (or use OPENAI_API_KEY env var)
             openrouter_api_key: OpenRouter API key (or use OPENROUTER_API_KEY env var)
+            ollama_api_key: Ollama API key (or use OLLAMA_API_KEY env var, defaults to 'ollama')
             think: Use advanced "thinking" model for complex queries
 
         Raises:
@@ -75,6 +80,7 @@ class LLMClient:
         # Get API keys from environment or parameters
         self.openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         self.openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.ollama_key = ollama_api_key or os.environ.get("OLLAMA_API_KEY") or "ollama"  # Dummy key for local Ollama
 
         # Support deprecated api_key parameter (assume OpenRouter for backward compatibility)
         if api_key and not self.openrouter_key:
@@ -94,16 +100,21 @@ class LLMClient:
                     "OpenRouter provider specified but OPENROUTER_API_KEY not found. "
                     "Please set OPENROUTER_API_KEY environment variable."
                 )
+            elif provider == "ollama" and not self.ollama_key:
+                # Ollama doesn't require a real API key, so provide a dummy one
+                self.ollama_key = "ollama"
         else:
             # Auto-detect provider (prefer OpenAI if both are available)
             if self.openai_key:
                 self.provider = "openai"
             elif self.openrouter_key:
                 self.provider = "openrouter"
+            elif self.ollama_key and self.ollama_key != "ollama":
+                self.provider = "ollama"
             else:
                 raise ValueError(
-                    "No API key found. Please set OPENAI_API_KEY or OPENROUTER_API_KEY "
-                    "environment variable, or pass openai_api_key or openrouter_api_key parameter."
+                    "No API key found. Please set OPENAI_API_KEY, OPENROUTER_API_KEY, or OLLAMA_API_KEY "
+                    "environment variable, or pass openai_api_key, openrouter_api_key, or ollama_api_key parameter."
                 )
 
         # Set API key and endpoint based on provider
@@ -117,7 +128,7 @@ class LLMClient:
                 else self.DEFAULT_MODELS["openai"]
             )
             self.model = model or os.environ.get("OPENAI_MODEL", default_model)
-        else:
+        elif self.provider == "openrouter":
             self.api_key = self.openrouter_key
             self.api_endpoint = self.API_ENDPOINTS["openrouter"]
             default_model = (
@@ -126,6 +137,15 @@ class LLMClient:
                 else self.DEFAULT_MODELS["openrouter"]
             )
             self.model = model or os.environ.get("OPENROUTER_MODEL", default_model)
+        elif self.provider == "ollama":
+            self.api_key = self.ollama_key
+            self.api_endpoint = self.API_ENDPOINTS["ollama"]
+            default_model = (
+                self.THINKING_MODELS["ollama"]
+                if think
+                else self.DEFAULT_MODELS["ollama"]
+            )
+            self.model = model or os.environ.get("OLLAMA_MODEL", default_model)
 
         self.timeout = timeout
 
@@ -323,11 +343,12 @@ Select the top {top_n} most relevant results:"""
             error_msg = f"{provider_name} API error (HTTP {status_code})"
 
             if status_code == 401:
-                env_var = (
-                    "OPENAI_API_KEY"
-                    if self.provider == "openai"
-                    else "OPENROUTER_API_KEY"
-                )
+                if self.provider == "openai":
+                    env_var = "OPENAI_API_KEY"
+                elif self.provider == "openrouter":
+                    env_var = "OPENROUTER_API_KEY"
+                else:
+                    env_var = "OLLAMA_API_KEY"
                 error_msg = f"Invalid {provider_name} API key. Please check {env_var} environment variable."
             elif status_code == 429:
                 error_msg = f"{provider_name} API rate limit exceeded. Please wait and try again."

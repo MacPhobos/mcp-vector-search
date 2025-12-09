@@ -57,9 +57,13 @@ class ProjectConfig(BaseSettings):
         default=None,
         description="OpenAI API key for chat command (optional, can also use env var)",
     )
+    ollama_api_key: str | None = Field(
+        default=None,
+        description="Ollama API key (optional, defaults to 'ollama' for local server)",
+    )
     preferred_llm_provider: str | None = Field(
         default=None,
-        description="Preferred LLM provider: 'openai' or 'openrouter' (auto-detect if not set)",
+        description="Preferred LLM provider: 'openai', 'openrouter', or 'ollama' (auto-detect if not set)",
     )
 
     @field_validator("project_root", "index_path", mode="before")
